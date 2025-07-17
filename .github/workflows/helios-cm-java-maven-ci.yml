@@ -1,0 +1,208 @@
+# Name of the GitHub Actions workflow
+name: (CM) Helios Java Maven CI
+
+# Define all trigger events for the workflow
+on:
+  # Allows manual triggering from GitHub UI
+  workflow_dispatch:
+  # Triggers on code pushes to any branch
+  push:
+    branches: ["*"]
+  # Allows this workflow to be reused by other workflows
+  workflow_call:
+    outputs:
+      # Outputs Docker image name to be passed to calling workflows
+      docker_image_name:
+        description: Name of the Docker image
+        value: ${{ jobs.docker_build.outputs.image_name }}
+      # Outputs Docker image tag to be passed to calling workflows
+      docker_image_tag:
+        description: Tag of the Docker image
+        value: ${{ jobs.docker_build.outputs.image_tag }}
+      # Outputs Docker image location (full registry path)
+      docker_image_location:
+        description: Location of the Docker image
+        value: ${{ jobs.docker_build.outputs.image_location }}
+
+# Start of all defined jobs
+jobs:
+  # --------------------------------------------
+  # Job 1: Initialization
+  # --------------------------------------------
+  initialization:
+    # Runs initialization steps and sets outputs
+    steps:
+      # Fetch context values from Helios to drive downstream jobs
+      - name: Initializing variables from Helios Context for downstream jobs
+        id: helios_context
+        uses: rbc-to/aed0-helios-context-action@v1
+        with:
+          # Provide full GitHub context as input to the action
+          github_context: ${{ toJSON(github) }}
+    outputs:
+      # Application code (e.g. abc-service)
+      app_code: ${{ steps.helios_context.outputs.app_code_lowercase }}
+      # Set project language
+      language: java
+      # Java version
+      version: '17'
+      # Java distribution
+      distribution: temurin
+      # Maven version to use
+      maven_version: '3.8.2'
+      # Path to the build artifacts
+      gh_artifacts_path: 'target/*.jar'
+      # Dockerfile to use
+      dockerfile: build-java-dockerfile
+      # Docker repo name
+      docker_repository: docker-${{ steps.helios_context.outputs.app_code_lowercase }}-dev
+      # Artifactory repo for Maven uploads
+      maven_upload_repo_name: maven-${{ steps.helios_context.outputs.app_code_lowercase }}-non-prod
+      # Flag to identify if it’s a release branch
+      is_release_branch: ${{ startsWith(github.ref_name, 'release') }}
+
+  # --------------------------------------------
+  # Job 2: Build Java Source Code
+  # --------------------------------------------
+  build:
+    # Calls the reusable build workflow for Java
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/build.yml@v2
+    needs: initialization
+    with:
+      # Java language
+      language: ${{ needs.initialization.outputs.language }}
+      # Java version
+      version: ${{ needs.initialization.outputs.version }}
+      # Java distribution
+      distribution: ${{ needs.initialization.outputs.distribution }}
+
+  # --------------------------------------------
+  # Job 3: Unit Test Execution
+  # --------------------------------------------
+  unit_test:
+    # Calls the reusable unit testing workflow
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/unit_test.yml@v2
+    needs: [initialization, build]
+    with:
+      language: ${{ needs.initialization.outputs.language }}
+      version: ${{ needs.initialization.outputs.version }}
+      distribution: ${{ needs.initialization.outputs.distribution }}
+
+  # --------------------------------------------
+  # Job 4: Build Command (Maven Build)
+  # --------------------------------------------
+  build_command:
+    # Depends on initialization
+    needs: [initialization]
+    # Runs on standard GHES runner
+    runs-on: ghes-runners-standard
+    steps:
+      # Run Maven package command with custom settings
+      - name: Run Maven build
+        run: |
+          mvn package \
+            --settings .helios/commons/maven/multi_stage_repo/settings.xml \
+            -Ddefine maven.test.skip=true \
+            --batch-mode
+
+  # --------------------------------------------
+  # Job 5: Open Source Scan
+  # --------------------------------------------
+  open_source_scan:
+    # Calls reusable open source scan workflow
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/open_source_scan.yml@v2
+    needs: [initialization, build]
+    with:
+      language: ${{ needs.initialization.outputs.language }}
+      version: ${{ needs.initialization.outputs.version }}
+      distribution: ${{ needs.initialization.outputs.distribution }}
+      gh_cache_path: ${{ needs.initialization.outputs.gh_cache_path }}
+      gh_artifacts_name: ${{ needs.initialization.outputs.gh_artifacts_name }}
+
+  # --------------------------------------------
+  # Job 6: Static App Security Testing (SAST)
+  # --------------------------------------------
+  sast_scan:
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/sast_scan.yml@v2
+    needs: [initialization, build]
+
+  # --------------------------------------------
+  # Job 7: SonarQube Code Quality Scan
+  # --------------------------------------------
+  code_quality_scan:
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/code_quality_scan.yml@v2
+    needs: [initialization, unit_test]
+    with:
+      project_type: maven
+      project_id: ${{ needs.initialization.outputs.sonarqube_project_id }}
+      language: ${{ needs.initialization.outputs.language }}
+      distribution: ${{ needs.initialization.outputs.distribution }}
+      version: ${{ needs.initialization.outputs.version }}
+      maven_version: ${{ needs.initialization.outputs.maven_version }}
+      build_file_path: pom.xml
+
+  # --------------------------------------------
+  # Job 8: Upload Build Artifacts to Artifactory (Non-Prod)
+  # --------------------------------------------
+  upload_artifacts:
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/upload_artifact.yml@v2
+    needs: [initialization, unit_test, open_source_scan, sast_scan]
+    with:
+      language: ${{ needs.initialization.outputs.language }}
+      version: ${{ needs.initialization.outputs.version }}
+      distribution: ${{ needs.initialization.outputs.distribution }}
+      maven_version: ${{ needs.initialization.outputs.maven_version }}
+      repository_type: maven
+      pom_xml_path: pom.xml
+      repository_name: ${{ needs.initialization.outputs.maven_upload_repo_name }}
+      maven_settings: xml
+      gh_cache_path: ${{ needs.initialization.outputs.gh_cache_path }}
+      gh_artifacts_path: ${{ needs.initialization.outputs.gh_artifacts_path }}
+      gh_artifacts_name: ${{ needs.initialization.outputs.gh_artifacts_name }}
+
+  # --------------------------------------------
+  # Job 9: Promote Artifacts to PROD (Release Branch Only)
+  # --------------------------------------------
+  promote_binary_artifacts:
+    if: ${{ needs.initialization.outputs.is_release_branch }}
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/promote_artifact.yml@v2
+    needs: [initialization, upload_artifacts]
+    with:
+      appcode: ${{ needs.initialization.outputs.app_code }}
+      artifact_paths: ${{ needs.upload_artifacts.outputs.artifact_path }}
+      source: non-prod
+      destination: prod
+
+  # --------------------------------------------
+  # Job 10: Docker Build for Java Project
+  # --------------------------------------------
+  docker_build:
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/build_docker.yml@v2
+    needs: [initialization, unit_test, open_source_scan, sast_scan]
+    with:
+      dockerfile: ${{ needs.initialization.outputs.dockerfile }}
+      docker_repository: ${{ needs.initialization.outputs.docker_repository }}
+      gh_artifacts_name: ${{ needs.initialization.outputs.gh_artifacts_name }}
+      gh_artifacts_path: target/
+
+  # --------------------------------------------
+  # Job 11: Container Image Scan
+  # --------------------------------------------
+  container_image_scan:
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/container_image_scan.yml@v2
+    needs: docker_build
+    with:
+      images: ${{ format('{0}', needs.docker_build.outputs.image_location) }}
+
+  # --------------------------------------------
+  # Job 12: Promote Docker Image to Prod (Release Branch Only)
+  # --------------------------------------------
+  promote_image_artifacts:
+    if: ${{ needs.initialization.outputs.is_release_branch }}
+    uses: rbc-to/aed0-helios-workflows/.github/workflows/promote_artifact.yml@v2
+    needs: [initialization, docker_build, container_image_scan]
+    with:
+      appcode: ${{ needs.initialization.outputs.app_code }}
+      artifact_paths: ${{ needs.docker_build.outputs.image_location }}
+      source: dev
+      destination: go
